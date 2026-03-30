@@ -380,13 +380,13 @@ Relays              Event Processor         Keycast          DynamoDB
 
 ## 8. Implementation Repositories
 
-| Repository | Status | Spec Location |
+| Repository | Status | Implementation Spec |
 |---|---|---|
-| `Synvya/keycast` | New (fork of `divinevideo/keycast`) | This document, Section 5 |
-| `Synvya/event-processor` | New | `event-processor/docs/specs/event-processor.md` |
-| `Synvya/mcp-server` | Existing | `mcp-server/docs/specs/thin-client-migration.md` |
-| `Synvya/client` | Existing | `client/docs/specs/auth-migration.md` |
-| `Synvya/docs` | New | This document |
+| [`Synvya/keycast`](https://github.com/Synvya/keycast) | New (fork of [`divinevideo/keycast`](https://github.com/divinevideo/keycast)) | This document, Section 5 |
+| [`Synvya/event-processor`](https://github.com/Synvya/event-processor) | New | [`docs/specs/event-processor.md`](https://github.com/Synvya/event-processor/blob/main/docs/specs/event-processor.md) |
+| [`Synvya/mcp-server`](https://github.com/Synvya/mcp-server) | Existing | [`docs/specs/thin-client-migration.md`](https://github.com/Synvya/mcp-server/blob/main/docs/specs/thin-client-migration.md) |
+| [`Synvya/client`](https://github.com/Synvya/client) | Existing | [`docs/specs/auth-migration.md`](https://github.com/Synvya/client/blob/main/docs/specs/auth-migration.md) |
+| [`Synvya/docs`](https://github.com/Synvya/docs) | New | This document |
 
 ### 8.1 Dependency Order
 
