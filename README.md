@@ -1,6 +1,6 @@
 # Synvya Docs
 
-Cross-cutting architecture and specification documents for Synvya. Documents that span multiple repositories live here. Single-repo implementation specs live in their respective repos and reference documents in this repo for system context.
+Cross-cutting architecture and specification documents for Synvya. Documents that span multiple repositories live here. Single-repo implementation specs live in their respective repos and reference documents in this repo for system context when appropriate.
 
 ## Documents
 
