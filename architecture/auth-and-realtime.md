@@ -4,9 +4,9 @@ System-wide architecture for Nostr key custody, flexible authentication, and 24/
 
 ## 1. Problem Statement
 
-Synvya's current architecture has two structural limitations:
+Synvya's current architecture has three structural limitations:
 
-1. **No 24/7 operation**: Nostr private keys live only in the restaurant owner's browser (IndexedDB). When the browser is closed, no events can be signed — reservation responses, profile updates, and offer publications all stop.
+1. **No 24/7 operation**: Nostr private keys live only in the restaurant owner's browser (IndexedDB). When the browser is closed, reservation requests go unanswered. Customers and AI agents cannot get responses until the owner opens the app.
 2. **No flexible authentication**: Users must manage Nostr keypairs directly. There is no email/password option and no path to social login. This limits adoption to Nostr-native users.
 3. **Nostr protocol leaks into the wrong layer**: The MCP server — whose job is providing an AI-friendly interface — contains Nostr protocol details (NIP-59 gift wrapping, relay WebSocket management, private key handling). This makes both the Nostr logic and the AI interface harder to maintain.
 
@@ -14,11 +14,11 @@ Synvya's current architecture has two structural limitations:
 
 **Nostr-first**: Nostr events on relays are the source of truth. All other data stores (DynamoDB, PostgreSQL) are caches or operational state. Every business action (publish profile, respond to reservation) ultimately produces a Nostr event.
 
-**Single Nostr boundary**: Exactly one service — the Event Processor — interacts with Nostr relays. All other services speak business-domain language (restaurants, reservations, menus) through internal APIs. No Nostr concepts (pubkeys, event kinds, gift wraps) leak into the MCP server or other consumer-facing interfaces.
+**Online vs. 24/7**: The system separates events that only matter when the restaurant owner is online (publishing profiles, menus, offers, reading reports) from events that must be processed 24/7 regardless of whether anyone is at the keyboard (receiving and responding to reservation requests). The Event Processor handles the 24/7 category. The client handles the online-only category.
 
 **Honest async**: Nostr is inherently asynchronous (publish event, wait for response on relays). Rather than hiding this behind fragile polling loops, expose it as a two-step pattern: submit a request, check its status later. AI agents handle multi-step workflows well.
 
-**Key separation**: No service other than Keycast ever holds or sees private keys. The Event Processor and MCP server request signatures via Keycast's HTTP RPC.
+**Keycast is for customers**: Keycast provides key custody and authentication for restaurant owners and customers — the people who log in to Synvya. Synvya's own service infrastructure (Lambdas, MCP server) keeps its own keys in AWS Secrets Manager. Not every nsec needs to go through Keycast.
 
 ## 3. Target Architecture
 
@@ -35,10 +35,12 @@ Synvya's current architecture has two structural limitations:
                     │                      │
                     │  • AI-friendly API   │
                     │  • Zero Nostr code   │
+                    │  • Own nsec in       │
+                    │    Secrets Manager   │
                     │  • Thin translation  │
                     │    layer             │
                     └──────────┬───────────┘
-                               │ Internal HTTP API
+                               │ Event Processor HTTP API
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  EC2 Instance                                                           │
@@ -47,13 +49,12 @@ Synvya's current architecture has two structural limitations:
 │  │  Event Processor          │    │  Keycast                         │  │
 │  │  (Node.js)                │    │  (Rust)                          │  │
 │  │                           │    │                                  │  │
-│  │  • Sole Nostr interface   │◄──►│  • Key custody (AES-256-GCM)    │  │
-│  │  • Persistent relay conns │    │  • Auth (email/pw, Nostr key)   │  │
-│  │  • NIP-59, NIP-RP logic   │    │  • Signing RPC (~50ms)          │  │
-│  │  • Internal HTTP API      │    │  • NIP-46 bunker                │  │
-│  │  • Event handlers         │    │                                  │  │
+│  │  • 24/7 relay listener    │◄──►│  • Key custody (AES-256-GCM)    │  │
+│  │  • Reservation processing │    │  • Auth (email/pw, Nostr key)   │  │
+│  │  • Auto-response engine   │    │  • Signing RPC (~50ms)          │  │
+│  │  • NIP-59, NIP-RP logic   │    │  • NIP-46 bunker                │  │
+│  │  • Internal HTTP API      │    │                                  │  │
 │  └─────────┬─────────────────┘    └──────────┬───────────────────────┘  │
-│            │                                  │                         │
 │            │                                  │                         │
 └────────────┼──────────────────────────────────┼─────────────────────────┘
              │                                  │
@@ -61,38 +62,49 @@ Synvya's current architecture has two structural limitations:
      │  Nostr Relays   │               │  RDS PostgreSQL  │
      │  (damus, nos.   │               │  ElastiCache     │
      │   lol, snort)   │               │  AWS KMS         │
-     └────────────────┘               └──────────────────┘
+     └───────┬────────┘               └──────────────────┘
              │
-             │ WebSocket (persistent)
-             ▼
-     ┌────────────────┐
+     ┌───────┴────────┐
      │  DynamoDB       │
      │  (event cache   │
      │   + reservation │
      │   state)        │
-     └────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Browser                                                                │
-│                                                                         │
+     └───────┬────────┘
+             │
+┌────────────┼────────────────────────────────────────────────────────────┐
+│  Browser   │                                                            │
+│            ▼                                                            │
 │  ┌──────────────────────────────────────────────────────────────────┐   │
 │  │  Synvya Client (React)                                           │   │
+│  │                                                                  │   │
+│  │  Online-only operations:                                         │   │
 │  │  • Login via Keycast (email/pw or Nostr key)                     │   │
-│  │  • Signs events via Keycast HTTP RPC                             │   │
-│  │  • Publishes events via relay connections (when online)          │   │
-│  │  • No private keys in browser                                    │   │
+│  │  • Publish profiles, menus, offers to relays                     │   │
+│  │  • Read & decrypt gift-wrapped reports (NIP-17) from relays      │   │
+│  │  • Signs events via Keycast HTTP RPC (no local keys)             │   │
+│  │                                                                  │   │
+│  │  Via Event Processor API:                                        │   │
+│  │  • View pending reservations                                     │   │
+│  │  • Accept/decline reservations (manual override)                 │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  Lambda Functions (own nsec in Secrets Manager)                   │   │
+│  │  • AI readiness report → gift-wrapped DM to restaurant           │   │
+│  │  • Nostr querier → DynamoDB event cache                          │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 4. Component Responsibilities
 
-| Component | Repository | Responsibility | Nostr Knowledge |
-|---|---|---|---|
-| **Keycast** | `Synvya/keycast` | Key custody, authentication, event signing | Signing only (no relay communication) |
-| **Event Processor** | `Synvya/event-processor` | Relay connections, event routing, NIP-59/NIP-RP protocol, internal API | Full (sole relay interface) |
-| **MCP Server** | `Synvya/mcp-server` | AI-agent-friendly tool interface, translates tool calls to Event Processor API | None |
-| **Client** | `Synvya/client` | Restaurant owner UI, login, profile/menu/offer editing | Minimal (relay publishing when online, event format construction) |
+| Component | Repository | Responsibility | Nostr Knowledge | Key Management |
+|---|---|---|---|---|
+| **Keycast** | `Synvya/keycast` | Key custody and authentication for restaurant owners and customers | Signing only (no relay communication) | Custodies customer keys (AES-256-GCM + KMS) |
+| **Event Processor** | `Synvya/event-processor` | 24/7 reservation processing: receive requests, auto-respond based on availability, publish responses | Full: NIP-59, NIP-RP, persistent relay connections | Signs via Keycast RPC (restaurant owner keys) |
+| **MCP Server** | `Synvya/mcp-server` | AI-agent-friendly tool interface, translates tool calls to Event Processor API | None | Own nsec in Secrets Manager (service identity) |
+| **Client** | `Synvya/client` | Restaurant owner UI: login, publish profiles/menus/offers, read reports, manual reservation override | Relay connections, event construction, NIP-17 gift wrap decryption | Signs via Keycast RPC (owner's session) |
+| **Lambda Functions** | `Synvya/client` (infra/) | AI readiness reports, Nostr relay querier, Square integration | NIP-17 gift wrap construction, relay queries | Own nsec in Secrets Manager |
 
 ## 5. Keycast Infrastructure
 
@@ -173,7 +185,7 @@ For external access from the MCP server (Vercel), the ALB routes `/api/events/*`
 ```
 POST /api/events/reservations
 Content-Type: application/json
-Authorization: Bearer <keycast-service-token>
+Authorization: Bearer <token>
 
 {
   "restaurant_id": "npub1abc...",
@@ -203,7 +215,7 @@ The Event Processor:
 
 ```
 GET /api/events/reservations/:reservation_id
-Authorization: Bearer <keycast-service-token>
+Authorization: Bearer <token>
 
 Response 200:
 {
@@ -223,7 +235,7 @@ Reads from DynamoDB. Status values: `pending`, `confirmed`, `declined`, `cancell
 
 ```
 GET /api/events/reservations?restaurant_id=npub1abc...&status=pending
-Authorization: Bearer <keycast-service-token>
+Authorization: Bearer <token>
 
 Response 200:
 {
@@ -239,7 +251,7 @@ Response 200:
 ```
 POST /api/events/reservations/:reservation_id/respond
 Content-Type: application/json
-Authorization: Bearer <keycast-service-token>
+Authorization: Bearer <token>
 
 {
   "status": "confirmed"
@@ -275,14 +287,14 @@ GET /api/events/restaurants/:id/offers
 
 ### 6.3 Authentication
 
-All internal API calls require a `Bearer` token. Two token types:
+All internal API calls require authentication:
 
-| Consumer | Token Source | Scope |
+| Consumer | Authentication | Scope |
 |---|---|---|
-| MCP Server | Keycast OAuth client credentials | Read/write reservations, read discovery data |
-| Client App | User's Keycast session token (passed through) | Read/write for own restaurant only |
+| MCP Server | API key or shared secret (configured in both services) | Create reservations, check status |
+| Client App | User's Keycast session token (passed through) | List/respond for own restaurant only |
 
-The Event Processor validates tokens by calling Keycast's token introspection endpoint.
+The Event Processor validates client tokens by calling Keycast's token introspection endpoint. MCP server authentication uses a simpler mechanism (API key) since both are Synvya-owned infrastructure.
 
 ## 7. Data Flow: Reservation Lifecycle
 
@@ -327,7 +339,42 @@ AI Agent                MCP Server              Event Processor         Keycast 
    │<──────────────────────│                         │                    │                │
 ```
 
-### 7.2 Restaurant Responds (via Client App)
+### 7.2 Event Processor Auto-Responds (24/7)
+
+```
+Relays              Event Processor         Keycast          DynamoDB
+   │                     │                    │                │
+   │  kind 1059          │                    │                │
+   │  (gift wrap with    │                    │                │
+   │   kind 9901 inside) │                    │                │
+   │────────────────────>│                    │                │
+   │                     │  nip44_decrypt     │                │
+   │                     │───────────────────>│                │
+   │                     │  plaintext (9901)  │                │
+   │                     │<───────────────────│                │
+   │                     │                    │                │
+   │                     │  Check availability│                │
+   │                     │  (tables, hours,   │                │
+   │                     │   existing bookings)│               │
+   │                     │─────────────────────────────────────>│
+   │                     │  availability data │                │
+   │                     │<─────────────────────────────────────│
+   │                     │                    │                │
+   │                     │  sign_event(9902)  │                │
+   │                     │───────────────────>│                │
+   │                     │  nip44_encrypt     │                │
+   │                     │───────────────────>│                │
+   │                     │                    │                │
+   │  publish 1059       │                    │                │
+   │<────────────────────│                    │                │
+   │                     │  write reservation │                │
+   │                     │  status: confirmed │                │
+   │                     │─────────────────────────────────────>│
+```
+
+### 7.3 Restaurant Owner Manual Override (via Client App)
+
+The owner can review auto-responses, override decisions, or respond to requests the auto-responder deferred:
 
 ```
 Client App              Event Processor         Keycast          Relays
@@ -347,35 +394,10 @@ Client App              Event Processor         Keycast          Relays
    │                         │  nip44_encrypt     │                │
    │                         │───────────────────>│                │
    │                         │                    │  publish 1059  │
-   │                         │───────────────────────────────────>│
+   │                         │─────────────────────────────────────>│
    │                         │  update DynamoDB   │                │
    │  { status: "confirmed" }│                    │                │
    │<────────────────────────│                    │                │
-```
-
-### 7.3 Restaurant Receives Reservation While Offline
-
-```
-Relays              Event Processor         Keycast          DynamoDB
-   │                     │                    │                │
-   │  kind 1059          │                    │                │
-   │  (gift wrap)        │                    │                │
-   │────────────────────>│                    │                │
-   │                     │  nip44_decrypt     │                │
-   │                     │───────────────────>│                │
-   │                     │  plaintext         │                │
-   │                     │<───────────────────│                │
-   │                     │  (inner: kind 9901)│                │
-   │                     │                    │                │
-   │                     │  write reservation │                │
-   │                     │  status: "pending" │                │
-   │                     │───────────────────────────────────>│
-   │                     │                    │                │
-   │  (later, owner opens client app)         │                │
-   │  GET /reservations?status=pending        │                │
-   │                     │───────────────────────────────────>│
-   │                     │  [pending list]    │                │
-   │                     │<───────────────────────────────────│
 ```
 
 ## 8. Implementation Repositories
@@ -431,17 +453,17 @@ CloudWatch alarms:
 
 | Concern | Mitigation |
 |---|---|
-| Private key exposure | Keys encrypted at rest (AES-256-GCM + KMS). Decrypted only in Keycast memory. Never transmitted to other services. |
+| Customer key exposure | Restaurant owner keys encrypted at rest (AES-256-GCM + KMS) in Keycast. Decrypted only in Keycast memory. Never transmitted to other services. |
+| Service key exposure | Synvya service keys (Lambda, MCP server) stored in AWS Secrets Manager. Not in Keycast — these are infrastructure keys, not customer keys. |
 | Man-in-the-middle | TLS everywhere: ALB terminates HTTPS, internal traffic on localhost (same EC2). |
-| Unauthorized signing | Policy-based authorization. Each OAuth app can only sign permitted event kinds. |
-| Session hijack | UCAN tokens (24h expiry). Stored in localStorage (client) or Parameter Store (services). |
+| Unauthorized signing | Keycast: policy-based authorization per OAuth app. Secrets Manager: IAM role-based access per Lambda/service. |
+| Session hijack | UCAN tokens (24h expiry) for customer sessions. API keys for service-to-service auth. |
 | Database breach | RDS encrypted at rest. Private subnet. Security group restricted to EC2 only. |
 | Relay impersonation | Events verified by Nostr signature. Gift wraps validated per NIP-17 (seal pubkey = rumor pubkey). |
 
 ## 11. Future Enhancements (v2+)
 
 - **Social login**: Google/Facebook via auth gateway (Cognito or custom) → Keycast account linking
-- **Auto-response engine**: Business rules in Event Processor for automatic reservation confirmation based on availability
 - **Discovery data serving**: Event Processor subscribes to kinds 0/30402/30405/31556, replaces Lambda `nostr-querier`
 - **DynamoDB Streams**: Push reservation status changes to MCP server instead of polling
 - **Horizontal scaling**: Second EC2 instance, Redis hashring distributes NIP-46 and Event Processor subscriptions
